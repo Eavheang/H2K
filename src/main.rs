@@ -1,23 +1,22 @@
-mod assets;
-mod theme;
+mod project;
 mod tray;
 mod views;
-mod window_chrome;
 
 use futures::StreamExt;
-use gpui_kit::{
-    App, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions,
-    prelude::*, px, size,
-};
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::{App, Bounds, QuitMode, WindowBounds, WindowDecorations, prelude::*, px, size};
 
 use tray::TrayEvent;
 use views::Root;
 
 fn main() {
     gpui_kit::application()
-        .with_assets(assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
+            // Kit default is light, which paints the window white. The old
+            // frame was a flat gray fill. Dark is the kit theme those panels use.
+            Theme::change(ThemeMode::Dark, None, cx);
 
             let (tx, mut rx) = futures::channel::mpsc::unbounded();
             match tray::spawn(tx) {
@@ -69,22 +68,20 @@ fn show_main_window(cx: &mut App) {
         return;
     }
 
-    let bounds = Bounds::centered(None, size(px(500.), px(500.)), cx);
-    // Our chrome Root, not gpui_kit::open_window: see CLAUDE.md, Architecture.
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_decorations: Some(WindowDecorations::Client),
-            // Shown by the shell (dock, alt-tab) instead of "Unknown".
-            titlebar: Some(TitlebarOptions {
-                title: Some("H2K".into()),
-                ..Default::default()
-            }),
-            app_id: Some("h2k".into()),
-            ..Default::default()
-        },
-        |_, cx| cx.new(Root::new),
-    )
-    .expect("failed to open window");
+    // Platform window size, not layout padding.
+    let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
+    let mut options = gpui_kit::component::TitleBar::window_options();
+    options.window_bounds = Some(WindowBounds::Windowed(bounds));
+    options.window_min_size = Some(size(px(720.), px(480.)));
+    // GNOME on Wayland draws no frame unless the window asks for client
+    // decorations. TitleBar and the kit window border both key off that mode.
+    options.window_decorations = Some(WindowDecorations::Client);
+    options.app_id = Some("h2k".into());
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        // Shown by the shell (dock, alt-tab) instead of "Unknown".
+        titlebar.title = Some("H2K".into());
+    }
+    gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Root::new(window, cx)))
+        .expect("failed to open window");
     cx.activate(true);
 }
