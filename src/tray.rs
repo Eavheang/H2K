@@ -3,7 +3,7 @@
 //! so they are forwarded to the GPUI main thread over a channel.
 
 use futures::channel::mpsc::UnboundedSender;
-use ksni::blocking::{Handle, TrayMethods};
+use ksni::blocking::TrayMethods;
 
 pub enum TrayEvent {
     Show,
@@ -60,14 +60,16 @@ impl ksni::Tray for Tray {
         ]
     }
 
-    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        eprintln!("tray watcher offline: {reason:?}");
         self.events.unbounded_send(TrayEvent::Gone).ok();
         false
     }
 }
 
 /// Fails when the desktop has no tray host (e.g. stock GNOME without the
-/// AppIndicator extension).
-pub fn spawn(events: UnboundedSender<TrayEvent>) -> Result<Handle<impl ksni::Tray>, ksni::Error> {
-    Tray { events }.spawn()
+/// AppIndicator extension). The service runs on its own thread until
+/// `watcher_offline` stops it; the returned handle isn't needed, so it is dropped.
+pub fn spawn(events: UnboundedSender<TrayEvent>) -> Result<(), ksni::Error> {
+    Tray { events }.spawn().map(drop)
 }

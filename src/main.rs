@@ -21,7 +21,7 @@ fn main() {
             match tray::spawn(tx) {
                 // Tray available: closing the window leaves the app running in the
                 // tray; only the tray's "Quit" exits.
-                Ok(_) => {
+                Ok(()) => {
                     cx.spawn(async move |cx| {
                         while let Some(event) = rx.next().await {
                             match event {
