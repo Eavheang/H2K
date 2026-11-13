@@ -1,4 +1,4 @@
-use gpui::{App, MouseButton, Window, div, prelude::*, px, rgb, svg};
+use gpui_kit::{App, MouseButton, Window, div, prelude::*, px, rgb, svg};
 
 use crate::theme;
 

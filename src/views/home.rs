@@ -1,4 +1,4 @@
-use gpui::{Context, SharedString, Window, div, prelude::*};
+use gpui_kit::{Context, SharedString, Window, div, prelude::*};
 
 pub struct Home {
     text: SharedString,

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-H2K is a Rust desktop application built on [GPUI](https://www.gpui.rs/) (Zed's GPU-accelerated UI framework). Single binary crate, Rust edition 2024. Currently a hello-world scaffold with a custom window frame.
+H2K is a Rust desktop application built on [GPUI Kit](https://gpui-kit.com/) (`gpui-kit` 0.9, which pins `gpui-pre` 0.3). Single binary crate, Rust edition 2024. Currently a hello-world scaffold with a custom window frame. `gpui-kit` is the dependency (rather than plain GPUI) for its editor, Markdown, tree, tabs and panel components, which upcoming screens use; no screen uses one yet.
 
 Layout:
 
@@ -30,23 +30,23 @@ cargo test <name>                 # run tests whose name contains <name>
 
 ## Architecture
 
-GPUI app structure as used here:
+GPUI Kit app structure as used here. Depend on `gpui-kit` only; GPUI types are `gpui_kit::*`, and the layers are `gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`, `gpui_kit::platform`.
 
-- `main()` calls `Application::new().run(|cx: &mut App| ...)`, which owns the event loop.
-- Windows are opened with `cx.open_window(WindowOptions, |window, cx| cx.new(|cx| View { .. }))`; the closure returns the root view entity.
+- `main()` calls `gpui_kit::application().with_assets(..).run(|cx| ...)`, which owns the event loop. `gpui_kit::init(cx)` runs first.
+- Windows are opened with `cx.open_window(WindowOptions, |window, cx| cx.new(|cx| View { .. }))`; the closure returns the root view entity. This is our chrome `Root`, not `gpui_kit::open_window`.
+- `gpui_kit::open_window` mounts `gpui_base::Root` so dialogs, sheets and other overlays work. On Linux client decorations that root also draws gpui-component's window border (20px shadow plus a 1px frame). Switching to it changes this window's frame; restyle the chrome in the same change.
 - A view is a plain struct implementing `Render`; `render()` returns an element tree built with `div()` and Tailwind-style builder methods (`.flex()`, `.size_full()`, `.bg(rgb(..))`, ...).
 - View state lives in `Entity<T>`s created via `cx.new`; mutate through `Context<T>` and call `cx.notify()` to re-render.
+- With a tray, `QuitMode::Explicit` keeps the process alive after the last window closes. Without a tray, or after the tray host disappears, `QuitMode::LastWindowClosed` quits. `gpui-pre` does this itself; there is no vendored GPUI patch.
 
 ## GPUI version caveat
 
-`gpui` is pinned to the crates.io release `0.2.2`. Zed's GPUI on GitHub `main` moves fast and differs from this release. Before using an API, confirm it exists in 0.2.2 (check `~/.cargo/registry/src/*/gpui-0.2.2/` or docs.rs/gpui/0.2.2) rather than trusting examples from Zed's repo or training data.
-
-The build uses a patched copy in `vendor/gpui/` (via `[patch.crates-io]`) so the app keeps running in the system tray after its last window closes. Read `vendor/gpui/PATCHED.md` before upgrading gpui.
+`gpui-kit` 0.9.1 pins `gpui-pre` 0.3.12 exactly. That is not crates.io `gpui` 0.2.2 and not Zed's GitHub `main`. Before using an API, confirm it on the pinned `gpui-pre` (docs.rs/gpui-pre/0.3.12, or the crate source) or on gpui-kit's docs, rather than trusting Zed `main` examples or older training data.
 
 ## Project skills
 
 Installed under `.agents/skills/` (symlinked into `.claude/skills/`, versions in `skills-lock.json`):
 
-- `gpui-kit`, `gpui-kit-design-guides`: from longbridge/gpui-kit. The GPUI mechanics sections apply here; the component sections (`gpui_kit::component::*`) only apply if the `gpui-kit` crate is added as a dependency, which it currently is not.
-- `gpui-test`: from Zed; covers `#[gpui::test]`, `TestAppContext`, seed reproduction. Written against Zed `main`, so verify against 0.2.2.
+- `gpui-kit`, `gpui-kit-design-guides`: from longbridge/gpui-kit. Mechanics and `gpui_kit::component::*` both apply; the crate is a dependency.
+- `gpui-test`: from Zed; covers `#[gpui::test]`, `TestAppContext`, seed reproduction. Written against Zed `main`. This repo's UI tests, when added, use `#[gpui_kit::test]` and should be checked against `gpui-pre` 0.3.12.
 - `rust-skills`: general Rust guidance.

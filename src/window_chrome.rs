@@ -7,7 +7,7 @@
 mod resize_handles;
 mod titlebar;
 
-use gpui::{Decorations, IntoElement, Window, div, prelude::*, rgb};
+use gpui_kit::{Decorations, IntoElement, Window, div, prelude::*, rgb};
 
 use crate::theme;
 
