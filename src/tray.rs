@@ -8,6 +8,9 @@ use ksni::blocking::{Handle, TrayMethods};
 pub enum TrayEvent {
     Show,
     Quit,
+    /// The tray host went away (e.g. AppIndicator extension disabled), so the
+    /// icon is gone and the tray service has stopped.
+    Gone,
 }
 
 struct Tray {
@@ -55,6 +58,11 @@ impl ksni::Tray for Tray {
             }
             .into(),
         ]
+    }
+
+    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+        self.events.unbounded_send(TrayEvent::Gone).ok();
+        false
     }
 }
 

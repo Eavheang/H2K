@@ -8,7 +8,9 @@ H2K is a Rust desktop application built on [GPUI](https://www.gpui.rs/) (Zed's G
 
 Layout:
 
-- `src/main.rs`: entry point. Opens the window, quits when the last window closes.
+- `src/main.rs`: entry point. Opens the window. With a tray, closing the window keeps the app running and the tray's Quit exits; without one (or if the tray host goes away), it quits when the last window closes.
+- `src/tray.rs`: system tray icon (StatusNotifierItem via `ksni`), forwards menu clicks to the main thread.
+- `src/assets.rs`: icons compiled into the binary from `assets/icons/`.
 - `src/theme.rs`: shared colors (hex `u32`, pass to `rgb(..)`).
 - `src/views/`: one file per view. `Root` is the window's root entity and wraps the current screen (`Home`) in the window chrome. Add new screens here.
 - `src/window_chrome/`: client-side decorations (titlebar with min/max/close, resize handles). Drawn only when `window.window_decorations()` is `Decorations::Client` (e.g. GNOME on Wayland).

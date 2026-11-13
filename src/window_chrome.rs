@@ -13,8 +13,11 @@ use crate::theme;
 
 /// Wraps `content` with the titlebar and resize handles when needed.
 pub fn frame(window: &Window, content: impl IntoElement) -> impl IntoElement {
-    let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
-    let resizable = client_decorated && !window.is_maximized() && !window.is_fullscreen();
+    let (client_decorated, tiled) = match window.window_decorations() {
+        Decorations::Client { tiling } => (true, tiling.is_tiled()),
+        Decorations::Server => (false, false),
+    };
+    let resizable = client_decorated && !tiled && !window.is_maximized() && !window.is_fullscreen();
 
     div()
         .relative()

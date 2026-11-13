@@ -21,38 +21,53 @@ fn main() {
             match tray::spawn(tx) {
                 // Tray available: closing the window leaves the app running in the
                 // tray; only the tray's "Quit" exits.
-                Ok(handle) => {
+                Ok(_) => {
                     cx.spawn(async move |cx| {
-                        let _handle = handle; // dropping it would remove the icon
                         while let Some(event) = rx.next().await {
-                            let quit = cx
-                                .update(|cx| match event {
-                                    TrayEvent::Show => show_main_window(cx),
-                                    TrayEvent::Quit => cx.quit(),
-                                })
-                                .is_err();
-                            if quit {
-                                break;
+                            match event {
+                                TrayEvent::Show => {
+                                    if cx.update(show_main_window).is_err() {
+                                        return;
+                                    }
+                                }
+                                TrayEvent::Quit => {
+                                    cx.update(|cx| cx.quit()).ok();
+                                    return;
+                                }
+                                TrayEvent::Gone => break,
                             }
                         }
+                        // Tray lost mid-session: bring back a window hidden in the
+                        // tray, since nothing else can reach it now.
+                        cx.update(|cx| {
+                            eprintln!("tray host went away, app will quit on window close");
+                            quit_when_last_window_closes(cx);
+                            if cx.windows().is_empty() {
+                                show_main_window(cx);
+                            }
+                        })
+                        .ok();
                     })
                     .detach();
                 }
-                // No tray host: quit when the last window closes, otherwise the app
-                // would keep running with no way to reach it.
                 Err(err) => {
                     eprintln!("tray unavailable ({err}), app will quit on window close");
-                    cx.on_window_closed(|cx| {
-                        if cx.windows().is_empty() {
-                            cx.quit();
-                        }
-                    })
-                    .detach();
+                    quit_when_last_window_closes(cx);
                 }
             }
 
             show_main_window(cx);
         });
+}
+
+/// Without a tray, the app would otherwise keep running with no way to reach it.
+fn quit_when_last_window_closes(cx: &mut App) {
+    cx.on_window_closed(|cx| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
 }
 
 /// Focus the main window, or open it if it was closed.
