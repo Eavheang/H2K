@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "skills": {
+    "gpui-kit": {
+      "source": "longbridge/gpui-kit",
+      "sourceType": "github",
+      "skillPath": "skills/gpui-kit/SKILL.md",
+      "computedHash": "f7b8b0e4a1f70e649a38720c04374a5a4bd597ba9cd6e2bc7bb5c83504ed4812"
+    },
+    "gpui-kit-design-guides": {
+      "source": "longbridge/gpui-kit",
+      "sourceType": "github",
+      "skillPath": "skills/gpui-kit-design-guides/SKILL.md",
+      "computedHash": "20d2e41da0baab7881683869cec2ddeea6fb01ce429a84eb6de968883d53e7ca"
+    },
+    "gpui-test": {
+      "source": "zed-industries/zed",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/gpui-test/SKILL.md",
+      "computedHash": "10198bfafc620db09c003aae3ce55908123b481e991fcd1eff0a3372a474ae46"
+    },
+    "rust-skills": {
+      "source": "leonardomso/rust-skills",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "94e92a36737ebd97af3c79710bf413609fd161cbdf02ce3fac5d9d5b5966697b"
+    }
+  }
+}
