@@ -17,7 +17,7 @@ impl Render for HelloWorld {
             .bg(rgb(0x505050))
             .text_xl()
             .text_color(rgb(0xffffff))
-            .child(format!("Hello worlds, {}!", &self.text))
+            .child(format!("Hello worlds, {}!", self.text))
     }
 }
 
