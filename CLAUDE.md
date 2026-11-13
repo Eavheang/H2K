@@ -4,7 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-H2K is a Rust desktop application built on [GPUI](https://www.gpui.rs/) (Zed's GPU-accelerated UI framework). Single binary crate, Rust edition 2024. Currently a hello-world scaffold: everything lives in `src/main.rs`.
+H2K is a Rust desktop application built on [GPUI](https://www.gpui.rs/) (Zed's GPU-accelerated UI framework). Single binary crate, Rust edition 2024. Currently a hello-world scaffold with a custom window frame.
+
+Layout:
+
+- `src/main.rs`: entry point. Opens the window. With a tray, closing the window keeps the app running and the tray's Quit exits; without one (or if the tray host goes away), it quits when the last window closes.
+- `src/tray.rs`: system tray icon (StatusNotifierItem via `ksni`), forwards menu clicks to the main thread.
+- `src/assets.rs`: icons compiled into the binary from `assets/icons/`.
+- `src/theme.rs`: shared colors (hex `u32`, pass to `rgb(..)`).
+- `src/views/`: one file per view. `Root` is the window's root entity and wraps the current screen (`Home`) in the window chrome. Add new screens here.
+- `src/window_chrome/`: client-side decorations (titlebar with min/max/close, resize handles). Drawn only when `window.window_decorations()` is `Decorations::Client` (e.g. GNOME on Wayland).
+
+Modules use `foo.rs` + `foo/` (no `mod.rs`).
 
 ## Commands
 
@@ -29,6 +40,8 @@ GPUI app structure as used here:
 ## GPUI version caveat
 
 `gpui` is pinned to the crates.io release `0.2.2`. Zed's GPUI on GitHub `main` moves fast and differs from this release. Before using an API, confirm it exists in 0.2.2 (check `~/.cargo/registry/src/*/gpui-0.2.2/` or docs.rs/gpui/0.2.2) rather than trusting examples from Zed's repo or training data.
+
+The build uses a patched copy in `vendor/gpui/` (via `[patch.crates-io]`) so the app keeps running in the system tray after its last window closes. Read `vendor/gpui/PATCHED.md` before upgrading gpui.
 
 ## Project skills
 
