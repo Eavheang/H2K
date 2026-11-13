@@ -1,4 +1,6 @@
-use gpui::{AnyElement, CursorStyle, Div, MouseButton, ResizeEdge, Stateful, div, prelude::*, px};
+use gpui_kit::{
+    AnyElement, CursorStyle, Div, MouseButton, ResizeEdge, Stateful, div, prelude::*, px,
+};
 
 const BORDER: f32 = 6.;
 

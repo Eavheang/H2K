@@ -1,4 +1,4 @@
-use gpui::{Context, Entity, Window, prelude::*};
+use gpui_kit::{Context, Entity, Window, prelude::*};
 
 use super::home::Home;
 use crate::window_chrome;

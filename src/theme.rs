@@ -1,4 +1,4 @@
-//! App-wide colors. Pass to `gpui::rgb(..)` at use sites.
+//! App-wide colors. Pass to `gpui_kit::rgb(..)` at use sites.
 
 pub const BACKGROUND: u32 = 0x505050;
 pub const TEXT: u32 = 0xffffff;
