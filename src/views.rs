@@ -1,6 +1,6 @@
 //! Views: structs implementing `Render`, each owned by an `Entity`.
 
-mod home;
 mod root;
+mod workspace;
 
 pub use root::Root;
