@@ -36,6 +36,10 @@ GPUI Kit app structure as used here. Depend on `gpui-kit` only; GPUI types are `
 - View state lives in `Entity<T>`s created via `cx.new`; mutate through `Context<T>` and call `cx.notify()` to re-render.
 - With a tray, `QuitMode::Explicit` keeps the process alive after the last window closes. Without a tray, or after the tray host disappears, `QuitMode::LastWindowClosed` quits. `gpui-pre` does this itself; there is no vendored GPUI patch.
 
+## UI components
+
+Build UI from gpui-kit components (catalog: https://gpui-kit.com/component). Before hand-rolling anything with `div()`, check `gpui_kit::component::*` for a match: `Dialog`/`AlertDialog` for modals, `Form`/`Field` for forms, `Alert` or `Notification` for errors and status, `Empty` for empty states, `Breadcrumb`, `Toolbar`, `DescriptionList`, `Tree`, `Resizable`, `Menu`, and so on. Plain `div()`/`h_flex()`/`v_flex()` is for layout between components, not for rebuilding one. If no component fits, say so before writing a custom one.
+
 ## GPUI version caveat
 
 `gpui-kit` 0.9.1 pins `gpui-pre` 0.3.12 exactly. That is not crates.io `gpui` 0.2.2 and not Zed's GitHub `main`. Before using an API, confirm it on the pinned `gpui-pre` (docs.rs/gpui-pre/0.3.12, or the crate source) or on gpui-kit's docs, rather than trusting Zed `main` examples or older training data.

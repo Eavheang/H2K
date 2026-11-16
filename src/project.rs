@@ -126,6 +126,57 @@ pub(crate) fn node_scope(id: &str) -> String {
     "Docs".to_string()
 }
 
+/// The node's path inside its root (`notes/a.md`), or `None` for a root.
+pub(crate) fn node_rel(id: &str) -> Option<&str> {
+    if let Some(rel) = id.strip_prefix("docs/") {
+        return Some(rel);
+    }
+    repo_child(id).map(|(_, rel)| rel)
+}
+
+/// The folder that holds `id`: the project for docs, else the linked repo.
+pub(crate) fn scope_path(project: &Path, id: &str) -> PathBuf {
+    if let Some((_, path)) = repo_root(id).or_else(|| repo_child(id).map(|(path, _)| (false, path)))
+    {
+        return PathBuf::from(path);
+    }
+    project.to_path_buf()
+}
+
+/// Current branch of the git repo at `path`. `None` when detached or not a repo.
+pub(crate) fn git_branch(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !branch.is_empty()).then_some(branch)
+}
+
+/// Largest file the viewer opens.
+pub(crate) const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+
+pub(crate) enum FileText {
+    Text(String),
+    Binary,
+    TooLarge(u64),
+}
+
+/// Text of `path` for display. A NUL byte in the first 8 KiB means binary.
+pub(crate) fn read_text(path: &Path) -> io::Result<FileText> {
+    let len = fs::metadata(path)?.len();
+    if len > MAX_TEXT_BYTES {
+        return Ok(FileText::TooLarge(len));
+    }
+    let bytes = fs::read(path)?;
+    if bytes.iter().take(8192).any(|&byte| byte == 0) {
+        return Ok(FileText::Binary);
+    }
+    Ok(FileText::Text(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 /// Create `workspace/name` with the standard layout and a git repo.
 /// An existing folder is left untouched.
 pub(crate) fn create_project(workspace: &Path, name: &str) -> Result<PathBuf, CreateError> {
@@ -805,6 +856,52 @@ mod tests {
             .find(|node| node.name == "notes")
             .unwrap();
         assert!(notes.children.is_empty());
+    }
+
+    #[test]
+    fn read_text_flags_binary_and_large_files() {
+        let dir = TempDir::new();
+        let text = dir.0.join("a.md");
+        fs::write(&text, "# Hi\n").unwrap();
+        assert!(matches!(read_text(&text).unwrap(), FileText::Text(body) if body == "# Hi\n"));
+        let binary = dir.0.join("a.bin");
+        fs::write(&binary, [0x89, b'P', 0, 1]).unwrap();
+        assert!(matches!(read_text(&binary).unwrap(), FileText::Binary));
+        let large = dir.0.join("big.txt");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(MAX_TEXT_BYTES + 1)
+            .unwrap();
+        assert!(matches!(read_text(&large).unwrap(), FileText::TooLarge(_)));
+    }
+
+    #[test]
+    fn node_rel_and_scope_path_split_ids() {
+        let project = Path::new("/p");
+        assert_eq!(node_rel("docs"), None);
+        assert_eq!(node_rel("docs/notes/a.md"), Some("notes/a.md"));
+        assert_eq!(node_rel("repo\0ok\0/code/be"), None);
+        assert_eq!(
+            node_rel("repo\0ok\0/code/be\0src/main.rs"),
+            Some("src/main.rs")
+        );
+        assert_eq!(scope_path(project, "docs/notes"), PathBuf::from("/p"));
+        assert_eq!(
+            scope_path(project, "repo\0ok\0/code/be\0src"),
+            PathBuf::from("/code/be")
+        );
+        assert_eq!(
+            scope_path(project, "repo\0missing\0/code/web"),
+            PathBuf::from("/code/web")
+        );
+    }
+
+    #[test]
+    fn git_branch_reads_an_unborn_branch() {
+        let workspace = TempDir::new();
+        let path = create_project(&workspace.0, "Demo").unwrap();
+        assert!(git_branch(&path).is_some_and(|branch| !branch.is_empty()));
+        assert_eq!(git_branch(&workspace.0), None);
     }
 
     #[test]

@@ -1,31 +1,42 @@
-//! Project shelf, new-project dialog, and the open project's file tree.
+//! Three panes: projects sidebar with the open project's file tree, a
+//! read-only file viewer, and a details panel for the selected node.
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use gpui_kit::assets::IconName as AssetIcon;
-use gpui_kit::base::Selectable;
+use gpui_kit::component::alert::Alert;
+use gpui_kit::component::breadcrumb::Breadcrumb;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::description_list::DescriptionList;
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::empty::{
+    Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
+};
+use gpui_kit::component::form::{field, v_form};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::label::Label;
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState};
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt, WindowExt, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, Context, Entity, Focusable, IntoElement, PathPromptOptions, SharedString, Subscription,
-    Window, div, prelude::*, rems,
+    AnyElement, App, Context, Entity, Focusable, IntoElement, PathPromptOptions, SharedString,
+    Subscription, Window, div, prelude::*, px, relative, rems,
 };
 
-use crate::project::{self, CreateError, FileNode};
+use crate::project::{self, CreateError, FileNode, FileText};
 
-/// How often the open tree re-reads expanded directories.
+/// How often the projects list, the open tree, and the open file are re-read.
 ///
 /// ponytail: poll on the UI thread. Switch to a watcher if an expanded repo hitches.
 const REFRESH: Duration = Duration::from_millis(500);
@@ -34,68 +45,104 @@ pub struct Workspace {
     project: Option<PathBuf>,
     project_name: SharedString,
     projects: Vec<String>,
+    /// Why the projects list could not be read.
+    list_error: Option<SharedString>,
     search: Entity<InputState>,
-    _search_events: Subscription,
     tree: Entity<TreeState>,
     expanded: HashSet<String>,
     fingerprint: Option<u64>,
+    /// Why the open tree could not be read. Cleared by the next good read.
+    tree_error: Option<SharedString>,
+    /// Result of the last create, link, or unlink. Stays until the next one.
     error: Option<SharedString>,
-    _events: Subscription,
+    selection: Option<Selection>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// The selected tree node, with what the viewer and details panel show.
+struct Selection {
+    id: SharedString,
+    /// Modified time and length of a file, to notice edits made outside H2K.
+    stamp: Option<(Option<SystemTime>, u64)>,
+    branch: Option<String>,
+    body: Body,
+}
+
+enum Body {
+    /// A folder or a missing repo: nothing to view.
+    None,
+    Text(Entity<EditorState>),
+    Message(SharedString),
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
-        let search_events = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        });
         let tree = cx.new(|cx| TreeState::new(cx));
-        let events = cx.subscribe(&tree, |this, _, event, cx| {
-            this.on_tree_event(event, cx);
-        });
+        let subscriptions = vec![
+            cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.reload(None, false, cx);
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&tree, window, |this, _, event, window, cx| {
+                this.on_tree_event(event, window, cx);
+            }),
+            cx.observe_in(&tree, window, |this, _, window, cx| {
+                this.sync_selection(window, cx);
+            }),
+        ];
         let mut workspace = Self {
             project: None,
             project_name: SharedString::default(),
             projects: Vec::new(),
+            list_error: None,
             search,
-            _search_events: search_events,
             tree,
             expanded: HashSet::new(),
             fingerprint: None,
+            tree_error: None,
             error: None,
-            _events: events,
+            selection: None,
+            _subscriptions: subscriptions,
         };
         workspace.refresh_projects();
-        workspace.watch(cx);
+        workspace.reload(None, true, cx);
+        workspace.watch(window, cx);
         workspace
     }
 
-    fn refresh_projects(&mut self) {
-        match project::workspace_root() {
-            Ok(root) => match project::list_projects(&root) {
-                Ok(names) => self.projects = names,
-                Err(err) => {
-                    self.projects.clear();
-                    self.error = Some(format!("Couldn’t list projects. {err}").into());
-                }
-            },
-            Err(err) => {
-                self.projects.clear();
-                self.error = Some(err.to_string().into());
-            }
-        }
+    /// `true` when the list changed.
+    fn refresh_projects(&mut self) -> bool {
+        let listed = project::workspace_root()
+            .map_err(|err| err.to_string())
+            .and_then(|root| {
+                project::list_projects(&root)
+                    .map_err(|err| format!("Couldn’t list projects. {err}"))
+            });
+        let (projects, error) = match listed {
+            Ok(names) => (names, None),
+            Err(err) => (Vec::new(), Some(SharedString::from(err))),
+        };
+        let changed = projects != self.projects || error != self.list_error;
+        self.projects = projects;
+        self.list_error = error;
+        changed
     }
 
-    fn watch(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    fn watch(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH).await;
-                if this
-                    .update(cx, |this, cx| this.reload(None, false, cx))
-                    .is_err()
-                {
+                let polled = this.update_in(cx, |this, window, cx| {
+                    if this.refresh_projects() {
+                        cx.notify();
+                    }
+                    this.reload(None, false, cx);
+                    this.sync_selection(window, cx);
+                });
+                if polled.is_err() {
                     break;
                 }
             }
@@ -103,47 +150,87 @@ impl Workspace {
         .detach();
     }
 
-    fn on_tree_event(&mut self, event: &TreeEvent, cx: &mut Context<Self>) {
-        let id = match event {
-            TreeEvent::Expanded(id) => {
-                self.expanded.insert(id.to_string());
-                id.clone()
-            }
-            TreeEvent::Collapsed(id) => {
-                self.expanded.remove(id.as_ref());
-                id.clone()
-            }
+    fn on_tree_event(&mut self, event: &TreeEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let (id, open) = match event {
+            TreeEvent::Expanded(id) => (id.clone(), true),
+            TreeEvent::Collapsed(id) => (id.clone(), false),
         };
         // `set_items` from this callback would re-enter `TreeState`.
-        let this = cx.weak_entity();
-        cx.defer(move |cx| {
-            this.update(cx, |this, cx| this.reload(Some(id), true, cx))
-                .ok();
+        cx.defer_in(window, move |this, window, cx| {
+            if let Some(path) = project_path_of(&id) {
+                if open {
+                    this.open_project(path, window, cx);
+                } else {
+                    this.close_project(cx);
+                }
+                return;
+            }
+            if open {
+                this.expanded.insert(id.to_string());
+            } else {
+                this.expanded.remove(id.as_ref());
+            }
+            this.reload(Some(id), true, cx);
         });
     }
 
+    /// Projects in the sidebar: the workspace's folders that match the
+    /// search, plus the open project when it is filtered out or imported
+    /// from elsewhere.
+    fn visible_projects(&self, cx: &App) -> Vec<PathBuf> {
+        let query = self.search.read(cx).value();
+        let mut paths: Vec<PathBuf> = match project::workspace_root() {
+            Ok(root) => self
+                .projects
+                .iter()
+                .filter(|name| project_matches_query(name, &query))
+                .map(|name| root.join(name))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if let Some(open) = &self.project
+            && !paths.contains(open)
+        {
+            paths.insert(0, open.clone());
+        }
+        paths
+    }
+
+    /// Rebuild the sidebar tree: one row per project, with the open
+    /// project's docs folder and linked repos under it.
     fn reload(&mut self, select: Option<SharedString>, force: bool, cx: &mut Context<Self>) {
-        let Some(root) = self.project.clone() else {
-            return;
+        let roots = match self.project.clone() {
+            None => Vec::new(),
+            Some(root) => match project::read_project_tree(&root, &self.expanded) {
+                Ok(nodes) => {
+                    if self.tree_error.take().is_some() {
+                        cx.notify();
+                    }
+                    nodes
+                }
+                Err(err) => {
+                    let error = SharedString::from(format!("Couldn’t read the project. {err}"));
+                    if self.tree_error.as_ref() != Some(&error) {
+                        self.tree_error = Some(error);
+                        cx.notify();
+                    }
+                    Vec::new()
+                }
+            },
         };
-        let nodes = match project::read_project_tree(&root, &self.expanded) {
-            Ok(nodes) => nodes,
-            Err(err) => {
-                self.error = Some(format!("Couldn’t read the project. {err}").into());
-                cx.notify();
-                return;
-            }
-        };
-        let fingerprint = fingerprint(&nodes);
-        let error_cleared = self.error.take().is_some();
+        let projects = self.visible_projects(cx);
+        let fingerprint = fingerprint(&projects, self.project.as_deref(), &roots);
         if !force && self.fingerprint == Some(fingerprint) {
-            if error_cleared {
-                cx.notify();
-            }
             return;
         }
         self.fingerprint = Some(fingerprint);
-        let items = tree_items(&nodes, &self.expanded);
+        let items: Vec<TreeItem> = projects
+            .iter()
+            .map(|path| {
+                let open = self.project.as_ref() == Some(path);
+                project_item(path, open, &roots, &self.expanded)
+            })
+            .collect();
         self.tree.update(cx, |tree, cx| {
             let keep = select.or_else(|| tree.selected_item().map(|item| item.id.clone()));
             tree.set_items(items, cx);
@@ -151,9 +238,55 @@ impl Workspace {
                 tree.set_selected_index(tree.index_of(&id), cx);
             }
         });
-        if error_cleared {
-            cx.notify();
-        }
+    }
+
+    /// Bring the viewer and details panel in line with the tree's selection,
+    /// and re-read the open file when it changed on disk.
+    fn sync_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = self.tree.read(cx).selected_item().and_then(|item| {
+            (!item.is_disabled() && project_path_of(&item.id).is_none())
+                .then(|| (item.id.clone(), item.is_folder()))
+        });
+        let (Some(root), Some((id, is_folder))) = (self.project.clone(), picked) else {
+            if self.selection.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        let missing = project::repo_root(&id).is_some_and(|(missing, _)| missing);
+        let path = project::node_path(&root, &id);
+        let viewable = !is_folder && !missing;
+        let stamp = if viewable { file_stamp(&path) } else { None };
+        let previous = self.selection.take().filter(|selection| selection.id == id);
+        // Rebuild below unless the same node is unchanged.
+        let previous = match previous {
+            Some(previous) if previous.stamp == stamp => {
+                self.selection = Some(previous);
+                return;
+            }
+            other => other,
+        };
+        let branch = match &previous {
+            Some(previous) => previous.branch.clone(),
+            None if missing => None,
+            None => project::git_branch(&project::scope_path(&root, &id)),
+        };
+        let body = if viewable {
+            let editor = previous.and_then(|previous| match previous.body {
+                Body::Text(editor) => Some(editor),
+                _ => None,
+            });
+            load_body(&path, editor, window, cx)
+        } else {
+            Body::None
+        };
+        self.selection = Some(Selection {
+            id,
+            stamp,
+            branch,
+            body,
+        });
+        cx.notify();
     }
 
     fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -162,13 +295,16 @@ impl Workspace {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
             .into();
+        let id = project_id(&path);
         self.project = Some(path);
         self.expanded.clear();
         self.expanded.insert(project::DOCS_ID.into());
         self.fingerprint = None;
+        self.tree_error = None;
         self.error = None;
+        self.selection = None;
         self.refresh_projects();
-        self.reload(None, true, cx);
+        self.reload(Some(id), true, cx);
         // Dialog close restores the trigger. Focus the tree after that.
         cx.on_next_frame(window, |this, window, cx| {
             this.tree.update(cx, |tree, cx| tree.focus(window, cx));
@@ -176,16 +312,14 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_named(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let root = match project::workspace_root() {
-            Ok(root) => root,
-            Err(err) => {
-                self.error = Some(err.to_string().into());
-                cx.notify();
-                return;
-            }
-        };
-        self.open_project(root.join(name), window, cx);
+    fn close_project(&mut self, cx: &mut Context<Self>) {
+        self.project = None;
+        self.project_name = SharedString::default();
+        self.selection = None;
+        self.tree_error = None;
+        self.error = None;
+        self.reload(None, true, cx);
+        cx.notify();
     }
 
     fn open_new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -349,196 +483,92 @@ impl Workspace {
         .detach();
     }
 
+    // Sidebar
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let workspace = cx.entity();
-        let query = self.search.read(cx).value();
-        let visible_projects = self
-            .projects
-            .iter()
-            .filter(|name| project_matches_query(name, &query))
-            .collect::<Vec<_>>();
-        let selected_project = self.project.as_ref().and_then(|path| {
-            let root = project::workspace_root().ok()?;
-            if path.parent() != Some(root.as_path()) {
-                return None;
-            }
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        });
-        v_flex()
-            .id("projects")
-            .w(rems(16.))
-            .h_full()
-            .flex_shrink_0()
+        let theme = cx.theme().colors;
+        let message = if self.list_error.is_some() {
+            None
+        } else if self.projects.is_empty() && self.project.is_none() {
+            Some("No projects yet")
+        } else if self.visible_projects(cx).is_empty() {
+            Some("No matching projects")
+        } else {
+            None
+        };
+        let list = v_flex()
+            .flex_1()
             .min_h_0()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .border_r_1()
-            .border_color(cx.theme().border)
             .px_2()
-            .py_2()
+            .pb_2()
+            .when_some(self.list_error.clone(), |list, error| {
+                list.child(Alert::error("list-error", error))
+            })
+            .when_some(message, |list, message| {
+                list.child(
+                    Label::new(message)
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .text_color(theme.muted_foreground),
+                )
+            })
+            .child(div().flex_1().min_h_0().child(self.render_tree(cx)));
+
+        v_flex()
+            .id("sidebar")
+            .size_full()
+            .min_h_0()
+            .bg(theme.sidebar)
+            .text_color(theme.sidebar_foreground)
             .child(
                 h_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_1()
-                    .flex_shrink_0()
+                    .p_2()
                     .child(
                         div().flex_1().min_w_0().child(
                             Input::new(&self.search)
-                                .small()
                                 .cleanable(true)
-                                .prefix(Icon::new(AssetIcon::Search).small()),
+                                .prefix(Icon::new(AssetIcon::Search)),
                         ),
                     )
                     .child(
-                        Button::new("refresh-projects")
-                            .small()
+                        Button::new("new-project")
                             .ghost()
-                            .icon(Icon::new(IconName::RefreshCw).small())
-                            .tooltip("Refresh projects")
-                            .accessibility_label("Refresh projects")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.refresh_projects();
-                                cx.notify();
+                            .icon(Icon::new(AssetIcon::FolderPlus))
+                            .tooltip("New project…")
+                            .accessibility_label("New project…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_new_project(window, cx);
                             })),
                     )
                     .child(
                         Button::new("import-project")
-                            .small()
                             .ghost()
-                            .icon(Icon::new(AssetIcon::FolderInput).small())
-                            .tooltip("Import project folder")
-                            .accessibility_label("Import project folder")
+                            .icon(Icon::new(AssetIcon::FolderInput))
+                            .tooltip("Import project folder…")
+                            .accessibility_label("Import project folder…")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.import_project(window, cx);
                             })),
                     ),
             )
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .mt_2()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .px_2()
-                            .pb_1()
-                            .child(div().text_sm().font_medium().child("Projects"))
-                            .child(
-                                Button::new("new-project-folder")
-                                    .small()
-                                    .ghost()
-                                    .icon(Icon::new(AssetIcon::FolderPlus).small())
-                                    .label("New project")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_new_project(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .id("project-list")
-                            .flex_1()
-                            .min_h_0()
-                            .gap_1()
-                            .overflow_y_scrollbar()
-                            .when(self.projects.is_empty(), |list| {
-                                list.child(
-                                    div()
-                                        .px_2()
-                                        .py_2()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("No projects yet"),
-                                )
-                            })
-                            .when(
-                                !self.projects.is_empty() && visible_projects.is_empty(),
-                                |list| {
-                                    list.child(
-                                        div()
-                                            .px_2()
-                                            .py_2()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("No matching projects"),
-                                    )
-                                },
-                            )
-                            .children(visible_projects.into_iter().map(|name| {
-                                let name = name.clone();
-                                let open_name = name.clone();
-                                let workspace = workspace.clone();
-                                let selected = selected_project.as_deref() == Some(name.as_str());
-                                Button::new(format!("project:{name}"))
-                                    .small()
-                                    .ghost()
-                                    .selected(selected)
-                                    .w_full()
-                                    .accessibility_label(format!("Open project {name}"))
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .min_w_0()
-                                            .items_center()
-                                            .justify_start()
-                                            .gap_2()
-                                            .child(Icon::new(IconName::Folder).small())
-                                            .child(div().min_w_0().flex_1().truncate().child(name)),
-                                    )
-                                    .on_click(move |_, window, cx| {
-                                        workspace.update(cx, |this, cx| {
-                                            this.open_named(&open_name, window, cx);
-                                        });
-                                    })
-                            })),
-                    ),
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .pl_4()
+                    .pr_2()
+                    .pb_1()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(theme.muted_foreground)
+                    .child("Projects"),
             )
-    }
-
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let path = self
-            .project
-            .as_ref()
-            .map(|path| project::display_path(path))
-            .unwrap_or_default();
-        h_flex()
-            .w_full()
-            .items_center()
-            .px_4()
-            .py_3()
-            .gap_3()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_medium()
-                            .truncate()
-                            .child(self.project_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .truncate()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(path),
-                    ),
-            )
-            .child(
-                Button::new("link-repo")
-                    .small()
-                    .ghost()
-                    .label("Link repo…")
-                    .on_click(cx.listener(|_, _, window, cx| pick_folder(window, cx, None))),
-            )
+            .child(list)
     }
 
     fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -565,169 +595,245 @@ impl Workspace {
                 menu
             };
             let workspace = workspace.clone();
-            menu.item(PopupMenuItem::new("Unlink").on_click(move |_, window, cx| {
-                let path = path.clone();
-                let name = name.clone();
-                workspace.update(cx, |this, cx| {
-                    this.confirm_unlink(name, path, window, cx);
-                });
-            }))
+            menu.item(
+                PopupMenuItem::new("Unlink…").on_click(move |_, window, cx| {
+                    let path = path.clone();
+                    let name = name.clone();
+                    workspace.update(cx, |this, cx| {
+                        this.confirm_unlink(name, path, window, cx);
+                    });
+                }),
+            )
         })
     }
 
-    fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.tree.read(cx).selected_item().and_then(|item| {
-            if item.is_disabled() {
-                None
-            } else {
-                Some((item.id.clone(), item.label.clone()))
+    // Main pane
+
+    fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let error = self.error.clone().or_else(|| self.tree_error.clone());
+        let body: AnyElement = if self.project.is_none() {
+            self.render_empty(cx)
+        } else {
+            match self.selection.as_ref().map(|selection| &selection.body) {
+                Some(Body::Text(editor)) => Editor::new(editor)
+                    .readonly(true)
+                    .bordered(false)
+                    .h(relative(1.))
+                    .into_any_element(),
+                Some(Body::Message(message)) => notice(message.clone()),
+                _ => notice("Select a file to view it.".into()),
             }
-        });
-        let mut panel = v_flex()
-            .id("inspector")
-            .w_64()
-            .h_full()
-            .min_h_0()
-            .flex_shrink_0()
-            .border_l_1()
-            .border_color(cx.theme().border)
-            .p_3()
-            .gap_3()
-            .overflow_y_scrollbar();
-        let Some((id, label)) = selected else {
-            return panel.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Select a file."),
-            );
         };
-        let Some(root) = self.project.as_ref() else {
-            return panel;
-        };
-        let path = project::display_path(&project::node_path(root, &id));
-        let scope = project::node_scope(&id);
-        let repo = project::repo_root(&id).map(|(missing, path)| (missing, PathBuf::from(path)));
-        let show_scope = repo.is_none();
-        panel = panel.child(div().truncate().child(label.clone()));
-        if show_scope {
-            panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(scope),
-            );
-        }
-        panel = panel.child(
-            div()
-                .text_sm()
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_color(cx.theme().muted_foreground)
-                .child(path),
-        );
-        let Some((missing, path)) = repo else {
-            return panel;
-        };
-        if missing {
-            panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().warning)
-                    .child("This folder is missing."),
-            );
-        }
-        let mut actions = h_flex().gap_2();
-        if missing {
-            let path = path.clone();
-            actions = actions.child(
-                Button::new("relink-repo")
-                    .small()
-                    .label("Relink…")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        pick_folder(window, cx, Some(path.clone()));
+        let mut toolbar = pane_toolbar("main-toolbar", cx).content(self.render_breadcrumb());
+        if self.project.is_some() {
+            toolbar = toolbar.child(
+                Button::new("link-repo")
+                    .ghost()
+                    .icon(Icon::new(AssetIcon::Link))
+                    .label("Link repo…")
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        pick_folder(window, cx, None);
                     })),
             );
         }
-        panel.child(
-            actions.child(
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .bg(cx.theme().background)
+            .child(toolbar)
+            .when_some(error, |column, error| {
+                column.child(Alert::error("workspace-error", error).banner())
+            })
+            .child(div().flex_1().min_h_0().min_w_0().child(body))
+    }
+
+    fn render_breadcrumb(&self) -> Breadcrumb {
+        let crumbs = Breadcrumb::new().flex_1().min_w_0();
+        if self.project.is_none() {
+            return crumbs.child("H2K");
+        }
+        let crumbs = crumbs.child(self.project_name.clone());
+        let Some(id) = self.selection.as_ref().map(|selection| &selection.id) else {
+            return crumbs;
+        };
+        let crumbs = crumbs.child(project::node_scope(id));
+        match project::node_rel(id) {
+            Some(rel) => crumbs.child(rel.to_string()),
+            None => crumbs,
+        }
+    }
+
+    fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (title, message) = if self.projects.is_empty() {
+            (
+                "No projects yet",
+                "A project is a folder of notes and decisions. Linked code stays where it already is.",
+            )
+        } else {
+            ("No project open", "Choose a project in the sidebar.")
+        };
+        Empty::new()
+            .size_full()
+            .header(
+                EmptyHeader::new()
+                    .media(EmptyMedia::new().child(Icon::new(AssetIcon::FolderOpen)))
+                    .title(EmptyTitle::new().child(title))
+                    .description(EmptyDescription::new().child(message)),
+            )
+            .content(
+                EmptyContent::new().child(
+                    Button::new("empty-new-project")
+                        .icon(Icon::new(AssetIcon::FolderPlus))
+                        .label("New project…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_new_project(window, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
+    // Details pane
+
+    fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let frame = v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(cx.theme().background)
+            .child(pane_toolbar("details-toolbar", cx).content("Details"));
+        let (Some(root), Some(selection)) = (self.project.as_ref(), self.selection.as_ref()) else {
+            return frame.child(notice("Select a file or folder.".into()));
+        };
+        let id = selection.id.clone();
+        let label = self
+            .tree
+            .read(cx)
+            .selected_item()
+            .map(|item| item.label.clone())
+            .unwrap_or_default();
+        let repo = project::repo_root(&id).map(|(missing, path)| (missing, PathBuf::from(path)));
+        let path = project::display_path(&project::node_path(root, &id));
+
+        let mut facts = DescriptionList::vertical()
+            .columns(1)
+            .bordered(false)
+            .item("Name", label.clone(), 1)
+            .item("Location", project::node_scope(&id), 1)
+            .item("Path", path, 1);
+        if let Some(branch) = selection.branch.clone() {
+            facts = facts.item("Branch", branch, 1);
+        }
+        let mut body = v_flex()
+            .id("details")
+            .flex_1()
+            .min_h_0()
+            .p_4()
+            .gap_6()
+            .child(facts);
+
+        if let Some((missing, path)) = repo {
+            let mut section = v_flex().gap_2();
+            if missing {
+                section = section.child(Alert::warning("repo-missing", "This folder is missing."));
+            }
+            let mut actions = h_flex().gap_2();
+            if missing {
+                let path = path.clone();
+                actions = actions.child(
+                    Button::new("relink-repo")
+                        .small()
+                        .label("Relink…")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            pick_folder(window, cx, Some(path.clone()));
+                        })),
+                );
+            }
+            actions = actions.child(
                 Button::new("unlink-repo")
                     .small()
-                    .ghost()
-                    .label("Unlink")
+                    .outline()
+                    .label("Unlink…")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.confirm_unlink(label.clone(), path.clone(), window, cx);
                     })),
-            ),
-        )
+            );
+            body = body.child(section.child(actions));
+        }
+        frame.child(body.overflow_y_scrollbar())
     }
+}
 
-    fn render_open(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .child(self.render_toolbar(cx))
-            .when_some(self.error.clone(), |column, error| {
-                column.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .child(error),
-                )
-            })
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .items_stretch()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .min_h_0()
-                            .child(self.render_tree(cx)),
-                    )
-                    .when(
-                        self.tree
-                            .read(cx)
-                            .selected_item()
-                            .is_some_and(|item| !item.is_disabled()),
-                        |row| row.child(self.render_inspector(cx)),
-                    ),
-            )
-    }
+/// Fixed-width lane so labels line up whether or not an icon is present.
+fn slot() -> gpui_kit::Div {
+    div()
+        .w_4()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+}
 
-    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let message = if self.projects.is_empty() {
-            "A project is a folder of notes and decisions. Linked code stays where it already is."
-        } else {
-            "Choose a project from the sidebar."
-        };
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .p_4()
-            .gap_2()
-            .child(
-                div()
-                    .text_lg()
-                    .font_medium()
-                    .child(if self.projects.is_empty() {
-                        "H2K"
-                    } else {
-                        "Projects"
-                    }),
+/// Toolbar shared by the main and details panes, so their bottom edges form
+/// one line.
+fn pane_toolbar(id: &'static str, cx: &App) -> Toolbar {
+    Toolbar::new(id)
+        .w_full()
+        .flex_shrink_0()
+        .px_4()
+        .border_b_1()
+        .border_color(cx.theme().border)
+}
+
+/// A one-line message in place of content.
+fn notice(message: SharedString) -> AnyElement {
+    Empty::new()
+        .size_full()
+        .header(EmptyHeader::new().description(EmptyDescription::new().child(message)))
+        .into_any_element()
+}
+
+fn file_stamp(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+/// Read `path` into `editor` (or a new one), or explain why it can't be shown.
+fn load_body(
+    path: &Path,
+    editor: Option<Entity<EditorState>>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Body {
+    match project::read_text(path) {
+        Ok(FileText::Text(text)) => Body::Text(match editor {
+            Some(editor) => {
+                editor.update(cx, |state, cx| state.set_value(text.as_str(), window, cx));
+                editor
+            }
+            None => {
+                let language = path
+                    .extension()
+                    .map(|ext| ext.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                cx.new(|cx| {
+                    EditorState::new(window, cx)
+                        .language(language)
+                        .line_number(true)
+                        .default_value(text)
+                })
+            }
+        }),
+        Ok(FileText::Binary) => Body::Message("Binary file. Only text files open here.".into()),
+        Ok(FileText::TooLarge(len)) => Body::Message(
+            format!(
+                "This file is {:.1} MB. Files up to {} MB open here.",
+                len as f64 / 1024. / 1024.,
+                project::MAX_TEXT_BYTES / 1024 / 1024
             )
-            .child(
-                div()
-                    .max_w(rems(28.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(message),
-            )
+            .into(),
+        ),
+        Err(err) => Body::Message(format!("Couldn’t read the file. {err}").into()),
     }
 }
 
@@ -742,8 +848,7 @@ fn project_matches_query(name: &str, query: &str) -> bool {
     name.to_lowercase().contains(&query.to_lowercase())
 }
 
-fn fingerprint(nodes: &[FileNode]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+fn fingerprint(projects: &[PathBuf], open: Option<&Path>, roots: &[FileNode]) -> u64 {
     fn walk(nodes: &[FileNode], hasher: &mut impl Hasher) {
         for node in nodes {
             node.name.hash(hasher);
@@ -752,8 +857,44 @@ fn fingerprint(nodes: &[FileNode]) -> u64 {
             walk(&node.children, hasher);
         }
     }
-    walk(nodes, &mut hasher);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    projects.hash(&mut hasher);
+    open.hash(&mut hasher);
+    walk(roots, &mut hasher);
     hasher.finish()
+}
+
+fn project_id(path: &Path) -> SharedString {
+    format!("project\0{}", path.display()).into()
+}
+
+fn project_path_of(id: &str) -> Option<PathBuf> {
+    id.strip_prefix("project\0").map(PathBuf::from)
+}
+
+/// A project row. Open, it holds the project's roots; closed, a stand-in
+/// child keeps it expandable.
+fn project_item(
+    path: &Path,
+    open: bool,
+    roots: &[FileNode],
+    expanded: &HashSet<String>,
+) -> TreeItem {
+    let id = project_id(path);
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut children = if open {
+        tree_items(roots, expanded)
+    } else {
+        Vec::new()
+    };
+    if children.is_empty() {
+        let label = if open { "Empty" } else { "" };
+        children.push(TreeItem::new(format!("{id}\0"), label).disabled(true));
+    }
+    TreeItem::new(id, label).children(children).expanded(open)
 }
 
 fn pick_folder(window: &mut Window, cx: &mut Context<Workspace>, replace: Option<PathBuf>) {
@@ -817,16 +958,13 @@ fn tree_items(nodes: &[FileNode], expanded: &HashSet<String>) -> Vec<TreeItem> {
         .collect()
 }
 
+/// Each level indents by one icon lane, so a child's chevron sits under its
+/// parent's icon.
 fn tree_row(entry: &TreeEntry, selected: bool, cx: &App) -> ListItem {
     let item = entry.item();
-    let placeholder = item.label.is_empty() || item.label.as_ref() == "Empty";
+    let placeholder = item.is_disabled();
     let missing = project::repo_root(&item.id).is_some_and(|(missing, _)| missing);
-    let mut chevron = div()
-        .w_4()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center();
+    let mut chevron = slot();
     if item.is_folder() {
         let icon = if item.is_expanded() {
             IconName::ChevronDown
@@ -835,14 +973,9 @@ fn tree_row(entry: &TreeEntry, selected: bool, cx: &App) -> ListItem {
         };
         chevron = chevron.child(Icon::new(icon).xsmall());
     }
-    let mut icon_slot = div()
-        .w_4()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center();
+    let mut icon_slot = slot();
     if !placeholder {
-        let mut icon = Icon::new(row_icon(item)).small();
+        let mut icon = row_icon(item).small();
         if missing {
             icon = icon.text_color(cx.theme().warning);
         }
@@ -860,35 +993,45 @@ fn tree_row(entry: &TreeEntry, selected: bool, cx: &App) -> ListItem {
                 .min_w_0()
                 .flex_1()
                 .truncate()
+                .when(placeholder, |label| {
+                    label.text_color(cx.theme().muted_foreground)
+                })
                 .child(item.label.clone()),
         );
     if missing {
         row = row.child(
             div()
                 .flex_shrink_0()
-                .text_sm()
+                .text_xs()
                 .text_color(cx.theme().warning)
                 .child("Missing"),
         );
     }
     ListItem::new(item.id.clone())
         .selected(selected)
-        .pl(rems(0.75 + entry.depth() as f32 * 0.75))
+        .pl(rems(0.5 + entry.depth() as f32 * 1.25))
         .child(row)
 }
 
-fn row_icon(item: &TreeItem) -> IconName {
+fn row_icon(item: &TreeItem) -> Icon {
+    if project_path_of(&item.id).is_some() {
+        return Icon::new(if item.is_expanded() {
+            AssetIcon::FolderOpen
+        } else {
+            AssetIcon::Folder
+        });
+    }
     if project::repo_root(&item.id).is_some_and(|(missing, _)| missing) {
-        return IconName::CircleAlert;
+        return Icon::new(IconName::CircleAlert);
     }
     if item.id.as_ref() == project::DOCS_ID {
-        return IconName::BookOpen;
+        return Icon::new(IconName::BookOpen);
     }
-    if item.is_folder() {
+    Icon::new(if item.is_folder() {
         IconName::Folder
     } else {
         IconName::File
-    }
+    })
 }
 
 struct NewProjectForm {
@@ -897,40 +1040,49 @@ struct NewProjectForm {
 }
 
 impl Render for NewProjectForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .w_full()
-            .gap_2()
-            .child("Name")
-            .child(Input::new(&self.name).id("project-name"))
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        v_form()
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Documents/h2k-projects"),
+                field()
+                    .label("Name")
+                    .description("Created in Documents/h2k-projects")
+                    .child(Input::new(&self.name).id("project-name")),
             )
             .when_some(self.error.clone(), |form, error| {
-                form.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                form.child(field().child(Alert::error("project-name-error", error)))
             })
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let main = if self.project.is_none() {
-            self.render_empty(cx).into_any_element()
-        } else {
-            self.render_open(cx).into_any_element()
-        };
         let radii = gpui_kit::component::window_corner_radii(window, cx);
-        h_flex()
+        // Panel widths are pixels because the resizable API takes `Pixels`.
+        div()
             .size_full()
             .min_h_0()
             .overflow_hidden()
             .rounded_bl(radii.bottom_left)
             .rounded_br(radii.bottom_right)
-            .child(self.render_sidebar(cx))
-            .child(main)
+            .child(
+                h_resizable("workspace-panes")
+                    .child(
+                        resizable_panel()
+                            .size(px(264.))
+                            .size_range(px(200.)..px(420.))
+                            .fixed()
+                            .child(self.render_sidebar(cx)),
+                    )
+                    .child(resizable_panel().child(self.render_main(cx)))
+                    .child(
+                        resizable_panel()
+                            .size(px(280.))
+                            .size_range(px(220.)..px(440.))
+                            .fixed()
+                            .visible(self.project.is_some())
+                            .child(self.render_details(cx)),
+                    ),
+            )
     }
 }
 
@@ -962,6 +1114,24 @@ mod tests {
         assert!(open[0].is_expanded());
         assert_eq!(open[0].children[0].label.as_ref(), "Empty");
         assert!(open[0].children[0].is_disabled());
+    }
+
+    #[test]
+    fn project_rows_hold_the_open_project_roots() {
+        let path = Path::new("/w/Demo");
+        let id = project_id(path);
+        assert_eq!(project_path_of(&id), Some(path.to_path_buf()));
+        assert_eq!(project_path_of("docs/notes"), None);
+
+        let closed = project_item(path, false, &[], &HashSet::new());
+        assert_eq!(closed.label.as_ref(), "Demo");
+        assert!(closed.is_folder());
+        assert!(!closed.is_expanded());
+
+        let roots = vec![dir("docs", "Demo")];
+        let open = project_item(path, true, &roots, &HashSet::new());
+        assert!(open.is_expanded());
+        assert_eq!(open.children[0].id.as_ref(), "docs");
     }
 
     #[test]

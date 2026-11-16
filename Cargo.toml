@@ -7,3 +7,9 @@ edition = "2024"
 futures = "0.3"
 gpui-kit = "0.9"
 ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+
+# Optimize dependencies (GPUI, text shaping, syntax highlighting) even in dev
+# builds. Unoptimized they make `cargo run` noticeably laggy; h2k itself stays
+# at opt-level 0 so rebuilds stay fast.
+[profile.dev.package."*"]
+opt-level = 2
