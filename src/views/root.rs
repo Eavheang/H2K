@@ -1,23 +1,26 @@
-use gpui_kit::{Context, Entity, Window, prelude::*};
+use gpui_kit::component::{TitleBar, v_flex};
+use gpui_kit::{Context, Entity, Window, div, prelude::*};
 
-use super::home::Home;
-use crate::window_chrome;
+use super::workspace::Workspace;
 
-/// The window's root view: wraps the current screen in the window chrome.
+/// Window content: kit title bar, then the project workspace.
 pub struct Root {
-    home: Entity<Home>,
+    workspace: Entity<Workspace>,
 }
 
 impl Root {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
-            home: cx.new(|_| Home::new("H2K")),
+            workspace: cx.new(|cx| Workspace::new(window, cx)),
         }
     }
 }
 
 impl Render for Root {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        window_chrome::frame(window, self.home.clone())
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .child(TitleBar::new().child("H2K"))
+            .child(div().flex_1().min_h_0().child(self.workspace.clone()))
     }
 }
